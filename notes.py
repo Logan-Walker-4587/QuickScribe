@@ -1,10 +1,20 @@
 import streamlit as st
 import sqlite3
 from streamlit_quill import st_quill
-import re # Import regex for cleaning description
+import re
+import html  # For escaping heading
 
 # Database setup
 DB_FILE = "notes.db"
+
+def get_text_color(bg_color):
+    try:
+        hex_color = bg_color.lstrip('#')
+        r, g, b = tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+        luminance = (0.299 * r + 0.587 * g + 0.114 * b) / 255
+        return '#000000' if luminance > 0.5 else '#FFFFFF'
+    except:
+        return '#000000'
 
 def init_db():
     conn = sqlite3.connect(DB_FILE)
@@ -23,13 +33,19 @@ def init_db():
             folder_id INTEGER,
             color TEXT DEFAULT '#FFFFE0',
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            body_color TEXT DEFAULT '#FFFFFF',
             FOREIGN KEY (folder_id) REFERENCES folders(id) ON DELETE CASCADE
         )
     """)
+    try:
+        cursor.execute("ALTER TABLE notes ADD COLUMN body_color TEXT DEFAULT '#FFFFFF'")
+    except sqlite3.OperationalError as e:
+        if "duplicate column name" not in str(e).lower():
+            st.warning(f"Could not add body_color column: {e}")
+
     conn.commit()
     conn.close()
 
-# Folder Functions
 def add_folder(name):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
@@ -56,18 +72,15 @@ def delete_folder(folder_id):
     conn.commit()
     conn.close()
 
-# Note Functions
-def add_note(heading, description, folder_id=None, color='#FFFFE0'):
+def add_note(heading, description, folder_id=None, banner_color='#FFFFE0', body_color='#FFFFFF'):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    # Clean description: Treat None, empty string, or quill's empty paragraph as empty
     cleaned_description = description
-    if cleaned_description is None or cleaned_description.strip() == "" or cleaned_description.strip() == "<p><br></p>":
+    if cleaned_description is None or cleaned_description.strip() in ["", "<p><br></p>"]:
         cleaned_description = ""
-
     cursor.execute(
-        "INSERT INTO notes (heading, description, folder_id, color) VALUES (?, ?, ?, ?)",
-        (heading, cleaned_description, folder_id, color)
+        "INSERT INTO notes (heading, description, folder_id, color, body_color) VALUES (?, ?, ?, ?, ?)",
+        (heading, cleaned_description, folder_id, banner_color, body_color)
     )
     conn.commit()
     conn.close()
@@ -75,24 +88,34 @@ def add_note(heading, description, folder_id=None, color='#FFFFE0'):
 def get_notes_by_folder(folder_id):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    if folder_id is None:
-        cursor.execute("SELECT id, heading, description, color FROM notes WHERE folder_id IS NULL ORDER BY created_at DESC")
-    else:
-        cursor.execute("SELECT id, heading, description, color FROM notes WHERE folder_id = ? ORDER BY created_at DESC", (folder_id,))
-    notes = cursor.fetchall()
+    try:
+        if folder_id is None:
+            cursor.execute("SELECT id, heading, description, color, body_color FROM notes WHERE folder_id IS NULL ORDER BY created_at DESC")
+        else:
+            cursor.execute("SELECT id, heading, description, color, body_color FROM notes WHERE folder_id = ? ORDER BY created_at DESC", (folder_id,))
+        notes = cursor.fetchall()
+    except sqlite3.OperationalError as e:
+        if "no such column: body_color" in str(e).lower():
+            if folder_id is None:
+                cursor.execute("SELECT id, heading, description, color FROM notes WHERE folder_id IS NULL ORDER BY created_at DESC")
+            else:
+                cursor.execute("SELECT id, heading, description, color FROM notes WHERE folder_id = ? ORDER BY created_at DESC", (folder_id,))
+            notes_old = cursor.fetchall()
+            notes = [(n[0], n[1], n[2], n[3], '#FFFFFF') for n in notes_old]
+        else:
+            raise
     conn.close()
     return notes
 
-def update_note(note_id, heading, description, color):
+def update_note(note_id, heading, description, banner_color, body_color):
     conn = sqlite3.connect(DB_FILE)
     cursor = conn.cursor()
-    # Clean description on update as well
     cleaned_description = description
-    if cleaned_description is None or cleaned_description.strip() == "" or cleaned_description.strip() == "<p><br></p>":
+    if cleaned_description is None or cleaned_description.strip() in ["", "<p><br></p>"]:
         cleaned_description = ""
     cursor.execute(
-        "UPDATE notes SET heading = ?, description = ?, color = ? WHERE id = ?",
-        (heading, cleaned_description, color, note_id)
+        "UPDATE notes SET heading = ?, description = ?, color = ?, body_color = ? WHERE id = ?",
+        (heading, cleaned_description, banner_color, body_color, note_id)
     )
     conn.commit()
     conn.close()
@@ -104,28 +127,51 @@ def delete_note(note_id):
     conn.commit()
     conn.close()
 
-# Initialize database
+# Initialize DB
 init_db()
 
-# Initialize session state
+# Initialize Session State
 if 'editing_note_id' not in st.session_state:
     st.session_state.editing_note_id = None
 if 'selected_folder_id' not in st.session_state:
     st.session_state.selected_folder_id = None
-# Initialize form values in session state if they don't exist
 if "new_note_heading_value" not in st.session_state:
     st.session_state["new_note_heading_value"] = ""
 if "new_note_quill_value" not in st.session_state:
     st.session_state["new_note_quill_value"] = ""
-# Initialize dynamic key counter for Quill editor
 if 'quill_key_suffix' not in st.session_state:
     st.session_state.quill_key_suffix = 0
-
 
 # Streamlit Page Setup
 st.set_page_config(page_title="QuickScribe", layout="wide")
 
-# Sidebar - Folder Management
+# Inject Custom CSS
+st.markdown("""
+<style>
+.note-card-display {
+    border: 1px solid #eee;
+    border-radius: 8px;
+    margin-bottom: 0.5rem;
+    word-wrap: break-word;
+    overflow: hidden;
+    box-shadow: 2px 2px 5px rgba(0,0,0,0.1);
+}
+.note-banner-display {
+    height: 10px; width: 100%; margin: 0; padding: 0; line-height: 10px;
+}
+.note-content-display {
+    padding: 0.5rem 1rem 1rem 1rem;
+}
+.note-heading-display {
+    margin-top: 0.5rem; margin-bottom: 0.5rem; padding: 0; font-weight: bold;
+}
+.note-description-display {
+    min-height: 20px;
+}
+</style>
+""", unsafe_allow_html=True)
+
+# Sidebar: Folder Management
 with st.sidebar:
     st.title("Folders")
     with st.form("new_folder_form", clear_on_submit=True):
@@ -136,13 +182,11 @@ with st.sidebar:
             st.rerun()
 
     st.divider()
-
     folders = get_folders()
 
     if st.button("🏠 Home", use_container_width=True, type="secondary" if st.session_state.selected_folder_id is None else "primary"):
         st.session_state.selected_folder_id = None
         st.session_state.editing_note_id = None
-        # Clear form fields and increment quill key
         st.session_state["new_note_heading_value"] = ""
         st.session_state["new_note_quill_value"] = ""
         st.session_state.quill_key_suffix += 1
@@ -155,7 +199,6 @@ with st.sidebar:
             if st.button(folder_name, key=f"select_folder_{folder_id}", use_container_width=True, type="secondary" if st.session_state.selected_folder_id == folder_id else "primary"):
                 st.session_state.selected_folder_id = folder_id
                 st.session_state.editing_note_id = None
-                # Clear form fields and increment quill key
                 st.session_state["new_note_heading_value"] = ""
                 st.session_state["new_note_quill_value"] = ""
                 st.session_state.quill_key_suffix += 1
@@ -165,13 +208,12 @@ with st.sidebar:
                 delete_folder(folder_id)
                 if st.session_state.selected_folder_id == folder_id:
                     st.session_state.selected_folder_id = None
-                    # Optionally clear form if deleting the current folder
-                    st.session_state["new_note_heading_value"] = ""
-                    st.session_state["new_note_quill_value"] = ""
-                    st.session_state.quill_key_suffix += 1
+                st.session_state["new_note_heading_value"] = ""
+                st.session_state["new_note_quill_value"] = ""
+                st.session_state.quill_key_suffix += 1
                 st.rerun()
 
-# Main Area - Notes
+# Main Area
 st.title("QuickScribe - Your Notes")
 
 current_folder_name = "Home"
@@ -179,37 +221,36 @@ if st.session_state.selected_folder_id is not None:
     selected_folder = next((f for f in folders if f[0] == st.session_state.selected_folder_id), None)
     if selected_folder:
         current_folder_name = selected_folder[1]
-    else: # If folder was deleted while selected
+    else:
         st.session_state.selected_folder_id = None
         st.rerun()
 
 st.header(f"Notes in: {current_folder_name}")
 
-# Form to Add New Note
 _, form_col, _ = st.columns([0.5, 2, 0.5])
 with form_col:
     st.header("Add a New Note")
     with st.form("new_note_form", clear_on_submit=True):
         note_heading = st.text_input("Note Heading", max_chars=100, value=st.session_state["new_note_heading_value"], key="new_note_heading")
-        # Use dynamic key for Quill editor
         note_description_html = st_quill(
-            placeholder="Enter note description...",
-            html=True,
+            placeholder="Enter note description...", html=True,
             key=f"new_note_quill_{st.session_state.quill_key_suffix}",
             value=st.session_state["new_note_quill_value"]
         )
-        new_note_color = st.color_picker("Note Color", value='#FFFFE0', key="new_note_color")
-        submitted = st.form_submit_button("Add Note")
+        col1, col2 = st.columns(2)
+        with col1:
+            new_banner_color = st.color_picker("Banner Color", value='#FFFFE0')
+        with col2:
+            new_body_color = st.color_picker("Body Color", value='#FFFFFF')
 
+        submitted = st.form_submit_button("Add Note")
         if submitted:
             if note_heading:
-                add_note(note_heading, note_description_html, st.session_state.selected_folder_id, new_note_color)
+                add_note(note_heading, note_description_html, st.session_state.selected_folder_id, new_banner_color, new_body_color)
                 st.success(f"Note added to '{current_folder_name}'!")
-                # Explicitly clear session state values for the form
                 st.session_state["new_note_heading_value"] = ""
                 st.session_state["new_note_quill_value"] = ""
-                st.session_state.editing_note_id = None # Ensure not in edit mode
-                # Increment dynamic key to force Quill re-render on next load
+                st.session_state.editing_note_id = None
                 st.session_state.quill_key_suffix += 1
                 st.rerun()
             else:
@@ -217,7 +258,6 @@ with form_col:
 
 st.divider()
 
-# Display Notes
 notes = get_notes_by_folder(st.session_state.selected_folder_id)
 
 if not notes:
@@ -225,69 +265,67 @@ if not notes:
 else:
     num_columns = 3
     cols = st.columns(num_columns)
-    for i, note in enumerate(notes):
-        note_id, heading, description, color = note
+    for i, note_data in enumerate(notes):
+        note_id, heading, description, banner_color, body_color = note_data
+
         col_index = i % num_columns
         with cols[col_index]:
-            # Use a div with dynamic style for background color
-            container_style = f"""
-                border: 1px solid #e6e6e6;
-                border-radius: 0.5rem;
-                padding: 1rem;
-                margin-bottom: 1rem;
-                background-color: {color};
-                /* Removed min-height */
-                word-wrap: break-word; /* Prevent long text overflow */
-            """
-            with st.container(): # Outer container for layout
-                 st.markdown(f'<div style="{container_style}">', unsafe_allow_html=True) # Start styled div
+            if st.session_state.editing_note_id == note_id:
+                with st.form(f"edit_form_{note_id}"):
+                    st.markdown(f'<div style="background-color:{banner_color}; height:10px; margin-bottom: 0.5rem;"></div>', unsafe_allow_html=True)
+                    st.subheader("Edit Note")
+                    edited_heading = st.text_input("Heading", value=heading, key=f"edit_head_{note_id}")
+                    edited_description_html = st_quill(value=description if description else "", html=True, key=f"edit_quill_{note_id}")
 
-                 if st.session_state.editing_note_id == note_id:
-                     with st.form(f"edit_form_{note_id}"):
-                         st.subheader("Edit Note")
-                         edited_heading = st.text_input("Heading", value=heading, key=f"edit_head_{note_id}")
-                         # Ensure description is not None for Quill editor
-                         edited_description_html = st_quill(value=description if description else "", html=True, key=f"edit_quill_{note_id}")
-                         edited_color = st.color_picker("Note Color", value=color, key=f"edit_color_{note_id}")
+                    ecol1, ecol2 = st.columns(2)
+                    with ecol1:
+                        edited_banner_color = st.color_picker("Banner Color", value=banner_color, key=f"edit_banner_color_{note_id}")
+                    with ecol2:
+                        edited_body_color = st.color_picker("Body Color", value=body_color, key=f"edit_body_color_{note_id}")
 
-                         edit_cols = st.columns(2)
-                         with edit_cols[0]:
-                             save_button = st.form_submit_button("Save")
-                         with edit_cols[1]:
-                             cancel_button = st.form_submit_button("Cancel")
+                    edit_cols_btns = st.columns(2)
+                    with edit_cols_btns[0]:
+                        save_button = st.form_submit_button("Save")
+                    with edit_cols_btns[1]:
+                        cancel_button = st.form_submit_button("Cancel")
 
-                         if save_button:
-                             if edited_heading:
-                                 update_note(note_id, edited_heading, edited_description_html, edited_color)
-                                 st.session_state.editing_note_id = None
-                                 st.success("Note updated successfully!")
-                                 st.rerun()
-                             else:
-                                 st.warning("Heading cannot be empty.")
-                         if cancel_button:
-                             st.session_state.editing_note_id = None
-                             st.rerun()
+                    if save_button:
+                        if edited_heading:
+                            update_note(note_id, edited_heading, edited_description_html, edited_banner_color, edited_body_color)
+                            st.session_state.editing_note_id = None
+                            st.success("Note updated successfully!")
+                            st.rerun()
+                        else:
+                            st.warning("Heading cannot be empty.")
+                    if cancel_button:
+                        st.session_state.editing_note_id = None
+                        st.rerun()
+            else:
+                safe_heading = html.escape(heading)
+                safe_description = description if description else ""
+                safe_description = re.sub(r'<script.*?>.*?</script>', '', safe_description, flags=re.IGNORECASE | re.DOTALL)
 
-                 else:
-                     st.subheader(heading)
-                     # Render description only if it's not empty
-                     if description and description.strip() != "":
-                         st.markdown(description, unsafe_allow_html=True)
-                     else:
-                         # Add a non-breaking space to ensure the div takes up space
-                         st.markdown("&nbsp;", unsafe_allow_html=True)
+                card_html = f"""
+                <div class="note-card-display" style="background-color: {body_color};">
+                    <div class="note-banner-display" style="background-color: {banner_color};"></div>
+                    <div class="note-content-display">
+                        <h3 class="note-heading-display">{safe_heading}</h3>
+                        <div class="note-description-display">{safe_description}</div>
+                    </div>
+                </div>
+                """
+                st.markdown(card_html, unsafe_allow_html=True)
 
-                     st.markdown("---") # Add a visual separator before buttons
-                     col1, col2 = st.columns(2)
-                     with col1:
-                         if st.button("✏️ Edit", key=f"edit_btn_{note_id}"):
-                             st.session_state.editing_note_id = note_id
-                             # Don't increment quill key here, edit form handles its own state
-                             st.rerun()
-                     with col2:
-                         if st.button("🗑️ Delete", key=f"delete_btn_{note_id}"):
-                             delete_note(note_id)
-                             st.success("Note deleted!")
-                             st.rerun()
-
-                 st.markdown('</div>', unsafe_allow_html=True) # End styled div
+                button_cols = st.columns(2)
+                with button_cols[0]:
+                    if st.button("✏️ Edit", key=f"edit_note_{note_id}"):
+                        st.session_state.editing_note_id = note_id
+                        st.session_state["new_note_heading_value"] = ""
+                        st.session_state["new_note_quill_value"] = ""
+                        st.session_state.quill_key_suffix += 1
+                        st.rerun()
+                with button_cols[1]:
+                    if st.button("🗑️ Delete", key=f"delete_note_{note_id}"):
+                        delete_note(note_id)
+                        st.success("Note deleted successfully!")
+                        st.rerun()
